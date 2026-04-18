@@ -1,92 +1,121 @@
-name: Build OpenCentauri Image
+name: Build & Release COSMOS Firmware
 
 on:
-  workflow_call:
-    inputs:
-      use_cache:
-        type: boolean
-        default: true
-      write_back_cache:
-        type: boolean
-        default: false
-      upload_all_artifacts:
-        type: boolean
-        default: false
-      version:
-        type: string
-        default: ''
+  # Manual trigger — always explicit, never accidental OTA pushes
   workflow_dispatch:
     inputs:
-      use_cache:
-        description: 'Use cache'
+      version:
+        description: 'Release version tag (e.g. jag-1.0.0)'
+        required: true
+        default: 'jag-0.0.1'
+      prerelease:
+        description: 'Mark as pre-release?'
         type: boolean
         default: true
-      write_back_cache:
-        description: 'Write back cache'
-        type: boolean
-        default: false
-      upload_all_artifacts:
-        description: 'Upload all artifacts'
-        type: boolean
-        default: false
-      version:
-        description: 'Override distro version'
-        type: string
-        default: ''
 
-env:
-  # Sims server cache dir
-  CACHE_DIR: /data/cache
+  # Also trigger on version tags: git tag jag-1.0.0 && git push --tags
+  push:
+    tags:
+      - 'jag-*'
 
 jobs:
   build:
-    runs-on: self-hosted
+    name: Yocto Build
+    # Use self-hosted runner if available, fall back to large GitHub runner
+    # For self-hosted: label your Linux build machine with 'yocto' in GitHub Actions settings
+    runs-on: ${{ vars.YOCTO_RUNNER || 'ubuntu-22.04' }}
+    timeout-minutes: 480  # 8 hours max
 
     steps:
-      - name: Checkout repository
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           submodules: recursive
+          fetch-depth: 1
 
-      - name: Restore cache
-        if: ${{ inputs.use_cache }}
+      - name: Install Yocto dependencies
         run: |
-          mkdir -p ./build
-          cp -ar ${{ env.CACHE_DIR }}/* ./build
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gawk wget git diffstat unzip texinfo gcc build-essential \
+            chrpath socat cpio python3 python3-pip python3-pexpect \
+            xz-utils debianutils iputils-ping python3-git python3-jinja2 \
+            libegl1-mesa libsdl1.2-dev pylint xterm python3-subunit \
+            mesa-common-dev zstd liblz4-tool file locales bmap-tools sunxi-tools
+          sudo locale-gen en_US.UTF-8
 
-      - name: Set distro version
-        if: ${{ inputs.version != '' }}
-        run: |
-          version="${{ inputs.version }}"
-          version="${version:0:10}"
-          sed -i -E "s/^DISTRO_VERSION = \".*\"/DISTRO_VERSION = \"${version}\"/" meta-opencentauri/conf/distro/cosmos.conf
+      - name: Restore sstate-cache
+        uses: actions/cache/restore@v4
+        id: sstate-cache
+        with:
+          path: build/sstate-cache
+          key: sstate-${{ runner.os }}-${{ hashFiles('meta-opencentauri/**') }}
+          restore-keys: |
+            sstate-${{ runner.os }}-
 
-      - name: Build image
+      - name: Restore downloads cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/downloads
+          key: downloads-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          restore-keys: |
+            downloads-${{ runner.os }}-
+
+      - name: Initialize Yocto build environment
         run: |
           source poky/oe-init-build-env build
-          bitbake opencentauri-upgrade
+          # Inject JAG FARM version into the build
+          echo "DISTRO_VERSION = \"${{ github.event.inputs.version || github.ref_name }}\"" >> conf/local.conf
+          echo "Build environment initialized"
 
-      - name: Upload build artifacts (SWU only)
-        uses: actions/upload-artifact@v4
-        with:
-          name: CC1 Firmware
-          path: build/tmp/deploy/images/elegoo-centauri-carbon1/opencentauri-upgrade-elegoo-centauri-carbon1.rootfs.swu
-
-      - name: Upload build artifacts
-        if: ${{ inputs.upload_all_artifacts }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: elegoo-centauri-carbon1-images
-          path: build/tmp/deploy/images/elegoo-centauri-carbon1/
-
-      - name: Write back cache
-        if: ${{ inputs.write_back_cache }}
+      - name: Build firmware image
         run: |
-          rm -rf ${{ env.CACHE_DIR }}/*
-          cp -ar ./build/downloads ${{ env.CACHE_DIR }}
-          cp -ar ./build/sstate-cache ${{ env.CACHE_DIR }}
+          source poky/oe-init-build-env build
+          bitbake opencentauri-image
 
-      - name: Clean workspace
+      - name: Save sstate-cache (speeds up future builds)
+        uses: actions/cache/save@v4
         if: always()
-        run: git clean -ffdx
+        with:
+          path: build/sstate-cache
+          key: sstate-${{ runner.os }}-${{ hashFiles('meta-opencentauri/**') }}
+
+      - name: Save downloads cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: build/downloads
+          key: downloads-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Locate built .swu
+        id: swu
+        run: |
+          SWU=$(find build/tmp/deploy/images -name "*.swu" | head -1)
+          echo "path=$SWU" >> $GITHUB_OUTPUT
+          echo "size=$(stat -c%s $SWU)" >> $GITHUB_OUTPUT
+          echo "Built SWU: $SWU ($(stat -c%s $SWU) bytes)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: "JAG Farm COSMOS ${{ github.event.inputs.version || github.ref_name }}"
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          body: |
+            ## JAG Farm COSMOS Firmware
+
+            Built from `skyking83/cosmos` fork of [OpenCentauri/cosmos](https://github.com/OpenCentauri/cosmos).
+
+            ### Fleet Customizations
+            - JAG Farm fleet macros (preheat, load/unload, park, calibration, status)
+            - Updated `cosmos.conf` with fleet identity
+            - Elegoo Centauri Carbon 1 × 6 tuned defaults
+
+            ### Install
+            Use the **JAG Print Farm app** → Firmware → Update All, or:
+            ```
+            # Via Moonraker API (single printer)
+            curl -X POST http://<printer-ip>/upload -F swu=@update.swu
+            ```
+          files: ${{ steps.swu.outputs.path }}
+          token: ${{ secrets.GITHUB_TOKEN }}
