@@ -17,6 +17,10 @@ on:
         type: choice
         options: ['false', 'true']
 
+# Required so GITHUB_TOKEN can create releases
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     name: Build opencentauri-upgrade and publish release
@@ -83,13 +87,18 @@ jobs:
           gh release create "$VERSION" \
             ~/cosmos/build/tmp/deploy/swu/update.swu \
             --title "COSMOS ${VERSION}" \
-            --notes "Automated build from commit ${{ github.sha }} — push to all printers via the JAG Print Farm app Firmware tab." \
+            --notes "Automated build from commit ${{ github.sha }} — install via the JAG Print Farm app Firmware tab." \
             $PRERELEASE_FLAG
           echo "Released: https://github.com/skyking83/cosmos/releases/tag/${VERSION}"
 
       - name: Build summary
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
-          echo "### COSMOS ${VERSION} released" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SWU size | ${{ steps.swu.outputs.swu_size }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Commit | ${{ github.sha }} |" >> "$GITHUB_STEP_SUMMARY"
+          SIZE="${{ steps.swu.outputs.swu_size }}"
+          {
+            echo "### COSMOS ${VERSION} released"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| SWU size | ${SIZE} |"
+            echo "| Commit | ${{ github.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
