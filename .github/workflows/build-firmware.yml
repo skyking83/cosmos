@@ -1,0 +1,95 @@
+name: Build & Release COSMOS Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.1)'
+        required: true
+        default: 'v0.1.0'
+      prerelease:
+        description: 'Mark as pre-release?'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  build-and-release:
+    name: Build opencentauri-upgrade and publish release
+    runs-on: [self-hosted, cosmos-builder]
+    timeout-minutes: 360
+
+    steps:
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=${{ inputs.prerelease }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show build info
+        run: |
+          echo "Version   : ${{ steps.ver.outputs.version }}"
+          echo "Commit    : ${{ github.sha }}"
+          echo "Triggered : ${{ github.event_name }}"
+          df -h /
+
+      - name: Update cosmos repo
+        run: |
+          cd ~/cosmos
+          git fetch origin
+          git checkout main
+          git pull --ff-only origin main
+          git submodule update --init --recursive
+
+      - name: Build opencentauri-upgrade
+        run: |
+          export LANG=en_US.UTF-8
+          export LC_ALL=en_US.UTF-8
+          cd ~/cosmos
+          source poky/oe-init-build-env build
+          bitbake opencentauri-upgrade
+
+      - name: Locate and verify SWU
+        id: swu
+        run: |
+          SWU=$(ls ~/cosmos/build/tmp/deploy/swu/opencentauri-upgrade-elegoo-centauri-carbon1.swu 2>/dev/null || true)
+          if [ -z "$SWU" ]; then
+            echo "ERROR: SWU not found after build"
+            exit 1
+          fi
+          SIZE=$(du -h "$SWU" | cut -f1)
+          echo "swu_path=$SWU" >> "$GITHUB_OUTPUT"
+          echo "swu_size=$SIZE" >> "$GITHUB_OUTPUT"
+          cp "$SWU" ~/cosmos/build/tmp/deploy/swu/update.swu
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          PRERELEASE="${{ steps.ver.outputs.prerelease }}"
+          PRERELEASE_FLAG=""
+          [ "$PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
+          cd ~/cosmos
+          gh release create "$VERSION" \
+            ~/cosmos/build/tmp/deploy/swu/update.swu \
+            --title "COSMOS ${VERSION}" \
+            --notes "Automated build from commit ${{ github.sha }} — push to all printers via the JAG Print Farm app Firmware tab." \
+            $PRERELEASE_FLAG
+          echo "Released: https://github.com/skyking83/cosmos/releases/tag/${VERSION}"
+
+      - name: Build summary
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          echo "### COSMOS ${VERSION} released" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SWU size | ${{ steps.swu.outputs.swu_size }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | ${{ github.sha }} |" >> "$GITHUB_STEP_SUMMARY"
